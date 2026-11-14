@@ -88,6 +88,93 @@ final class BackgroundDeliveryEnablementState: @unchecked Sendable {
   }
 }
 
+/// A flag shared by the read and upload tasks of one sync.
+final class SyncPipelineFlag: @unchecked Sendable {
+  private let lock = NSLock()
+  private var flag = false
+
+  func set() {
+    lock.withLock { flag = true }
+  }
+
+  var isSet: Bool {
+    lock.withLock { flag }
+  }
+}
+
+/// How a sync ended.
+enum SyncOutcome: Equatable {
+  /// It did not run, or did not run to completion.
+  case incomplete
+
+  /// It ran to completion. `uploaded` tells whether it sent anything to the backend, which
+  /// a sync with nothing new does not.
+  case completed(uploaded: Bool)
+}
+
+extension SyncProgress.SyncStatus {
+  /// The sync failed for a reason a later attempt can get past, such as a locked phone or
+  /// a dropped connection.
+  var isRetryableFailure: Bool {
+    switch self {
+    case .error, .expectedError, .timedOut, .cancelled:
+      return true
+    case .deprioritized, .started, .readChunk, .uploadedChunk, .noData, .completed,
+        .revalidatingSyncState, .connectionPaused, .connectionDestroyed:
+      return false
+    }
+  }
+}
+
+extension SyncProgress.Sync {
+  /// The sync recorded a failure, or stopped without reaching its end. The second covers a
+  /// sync that was cancelled or whose process was killed before it could record anything.
+  ///
+  /// A deprioritized sync is neither: it is waiting for its turn in the historical stage.
+  var didNotFinish: Bool {
+    guard lastStatus != .deprioritized else { return false }
+
+    return statuses.contains(where: \.type.isRetryableFailure)
+      || (lastStatus != .completed && lastStatus != .noData)
+  }
+}
+
+/// How long an unfinished sync waits before a delivery for another resource retries it. A
+/// resource that fails every time is then retried a few times an hour at most, instead of
+/// on every delivery.
+let failedSyncRetryInterval: TimeInterval = 15 * 60
+
+/// How many unfinished syncs one delivery retries. The rest wait for the next delivery or
+/// for the rescue at launch.
+let maxRetriesPerDelivery = 3
+
+/// The active resources whose last sync did not finish and has been quiet for at least
+/// `failedSyncRetryInterval`, in sync priority order. Leaves out the ones the current
+/// delivery has just synced and the ones syncing right now.
+func resourcesPendingRetry(
+  in progress: SyncProgress,
+  activeResources: Set<RemappedVitalResource>,
+  excluding delivered: Set<RemappedVitalResource>,
+  syncing: Set<VitalResource>,
+  now: Date
+) -> [RemappedVitalResource] {
+  activeResources
+    .subtracting(delivered)
+    .filter { resource in
+      guard
+        syncing.contains(resource.wrapped) == false,
+        let latestSync = progress.backfillTypes[resource.wrapped.backfillType]?.latestSync,
+        latestSync.didNotFinish,
+        let lastActiveAt = latestSync.statuses.last?.timestamp
+      else { return false }
+
+      return now.timeIntervalSince(lastActiveAt) >= failedSyncRetryInterval
+    }
+    .sorted { lhs, rhs in
+      (lhs.wrapped.priority, lhs.wrapped.logDescription) < (rhs.wrapped.priority, rhs.wrapped.logDescription)
+    }
+}
+
 final class BackgroundProcessingTaskState: @unchecked Sendable {
   private let lock = NSLock()
   private var expired = false
@@ -452,6 +539,8 @@ extension VitalHealthKitClient {
       (stream, streamContinuation) = backgroundObservers(for: bundles.lazy.flatMap { $0 })
     }
 
+    let activeResources = state.activeResources
+
     let payloadListener = scope.task(priority: .userInitiated) {
       var bufferedPayloads: [BackgroundDeliveryPayload] = []
       var timer: Task<Void, Never>?
@@ -487,39 +576,7 @@ extension VitalHealthKitClient {
           let payloads = bufferedPayloads
           bufferedPayloads = []
 
-          // Task is not cancelled — we must call the HealthKit completion handler irrespective of
-          // the sync process outcome. This is to avoid triggering the "strike on 3rd missed delivery"
-          // rule of HealthKit background delivery.
-          //
-          // Since we have fairly frequent delivery anyway, each of which will implicit retry from
-          // where the last sync has left off, this unconfigurable exponential backoff retry
-          // behaviour adds little to no value in maintaining data freshness.
-          //
-          // (except for the task cancellation redelivery expectation stated above).
-          defer { payloads.forEach { $0.completion(.completed) } }
-
-          let prioritizedResources = Set(payloads.flatMap(\.resources))
-            .sorted(by: { $0.wrapped.priority < $1.wrapped.priority })
-          let syncsConcurrently = AppStateTracker.shared.state.status == .foreground
-
-          VitalLogger.healthKit.info(
-            "dequeued: \(prioritizedResources); will sync \(syncsConcurrently ? "concurrent" : "serially")",
-            source: "BgDelivery"
-          )
-
-          if syncsConcurrently {
-            await withTaskGroup(of: Void.self) { group in
-              for resource in prioritizedResources {
-                group.addTask {
-                  await self.sync(resource, [.healthKit])
-                }
-              }
-            }
-          } else {
-            for resource in prioritizedResources {
-              await self.sync(resource, [.healthKit])
-            }
-          }
+          await self.process(payloads, activeResources: activeResources)
         }
       }
     }
@@ -530,6 +587,124 @@ extension VitalHealthKitClient {
       objectTypes: state.determinedObjectTypes,
       streamContinuation: streamContinuation
     )
+  }
+
+  /// Handle one batch of HealthKit observer callouts.
+  // @testable
+  func process(
+    _ payloads: [BackgroundDeliveryPayload],
+    activeResources: Set<RemappedVitalResource>,
+    now: Date = Date()
+  ) async {
+    // Task is not cancelled — we must call the HealthKit completion handler irrespective of
+    // the sync process outcome. This is to avoid triggering the "strike on 3rd missed delivery"
+    // rule of HealthKit background delivery.
+    //
+    // Since we have fairly frequent delivery anyway, each of which will implicit retry from
+    // where the last sync has left off, this unconfigurable exponential backoff retry
+    // behaviour adds little to no value in maintaining data freshness.
+    //
+    // (except for the task cancellation redelivery expectation stated above).
+    //
+    // Each handler is called exactly once: as soon as the delivered resources have synced,
+    // or on the way out if that point is never reached.
+    let acknowledgement = OneShotCompletion<Void> {
+      payloads.forEach { $0.completion(.completed) }
+    }
+    defer { acknowledgement.complete(()) }
+
+    let deliveredResources = Set(payloads.flatMap(\.resources))
+    let syncsConcurrently = AppStateTracker.shared.state.status == .foreground
+
+    VitalLogger.healthKit.info(
+      "dequeued: \(deliveredResources); will sync \(syncsConcurrently ? "concurrent" : "serially")",
+      source: "BgDelivery"
+    )
+
+    await syncDelivered(
+      deliveredResources,
+      activeResources: activeResources,
+      concurrently: syncsConcurrently,
+      now: now,
+      acknowledge: { acknowledgement.complete(()) }
+    )
+  }
+
+  /// Sync the resources HealthKit has just notified us about, then retry a few of the ones
+  /// whose last sync did not finish.
+  ///
+  /// HealthKit only notifies a resource again when its own data changes. A sync that failed
+  /// because the phone was locked or offline would otherwise wait for that, which for sleep
+  /// or weight can be a day away.
+  ///
+  /// `acknowledge` tells HealthKit the delivery is handled. It is called once the delivered
+  /// resources have synced and before any retry, because HealthKit backs off an app that is
+  /// slow to answer and the retries are not what it is waiting for.
+  ///
+  /// The retries only run when a delivered resource has uploaded something in this
+  /// delivery. That shows the phone is unlocked and the backend reachable; a sync with
+  /// nothing new completes without either, and a phone that is still locked or offline
+  /// should not repeat every failure on every delivery.
+  // @testable
+  func syncDelivered(
+    _ deliveredResources: Set<RemappedVitalResource>,
+    activeResources: Set<RemappedVitalResource>,
+    concurrently: Bool,
+    now: Date = Date(),
+    acknowledge: () -> Void
+  ) async {
+    let delivered = deliveredResources
+      .sorted(by: { $0.wrapped.priority < $1.wrapped.priority })
+
+    let uploaded = await sync(delivered, [.healthKit], concurrently: concurrently)
+    acknowledge()
+
+    guard uploaded else {
+      return
+    }
+
+    let pendingRetry = resourcesPendingRetry(
+      in: SyncProgressStore.shared.get(),
+      activeResources: activeResources,
+      excluding: deliveredResources,
+      syncing: SyncProgressReporter.shared.syncingResources(),
+      now: now
+    ).prefix(maxRetriesPerDelivery)
+
+    guard !pendingRetry.isEmpty else {
+      return
+    }
+
+    VitalLogger.healthKit.info("retrying unfinished syncs: \(Array(pendingRetry))", source: "BgDelivery")
+    await sync(Array(pendingRetry), [.maintenanceTask], concurrently: concurrently)
+  }
+
+  /// - returns: Whether any of the resources ran to completion and uploaded something.
+  @discardableResult
+  private func sync(
+    _ resources: [RemappedVitalResource],
+    _ tags: Set<SyncContextTag>,
+    concurrently: Bool
+  ) async -> Bool {
+    if concurrently {
+      return await withTaskGroup(of: SyncOutcome.self, returning: Bool.self) { group in
+        for resource in resources {
+          group.addTask {
+            await self.sync(resource, tags)
+          }
+        }
+
+        return await group.reduce(false) { $0 || $1 == .completed(uploaded: true) }
+      }
+    }
+
+    var anyUploaded = false
+    for resource in resources {
+      if await self.sync(resource, tags) == .completed(uploaded: true) {
+        anyUploaded = true
+      }
+    }
+    return anyUploaded
   }
 
   private func retryFailedBackgroundDeliveryEnablement() {
@@ -681,8 +856,7 @@ extension VitalHealthKitClient {
           return !knownSyncingResources.contains(resource.wrapped)
         }
 
-        return lastStatus == .error || lastStatus == .cancelled
-        || lastStatus == .timedOut || lastStatus == .started || lastStatus == .deprioritized
+        return lastStatus.isRetryableFailure || lastStatus == .started || lastStatus == .deprioritized
         || (connectionActive && (lastStatus == .connectionPaused || lastStatus == .connectionDestroyed))
       }
 
@@ -1055,7 +1229,9 @@ extension VitalHealthKitClient {
     }
   }
 
-  private func sync(_ remappedResource: RemappedVitalResource, _ tags: Set<SyncContextTag>) async {
+  // @testable
+  @discardableResult
+  func sync(_ remappedResource: RemappedVitalResource, _ tags: Set<SyncContextTag>) async -> SyncOutcome {
     let progressStore = SyncProgressStore.shared
     let progressReporter = SyncProgressReporter.shared
 
@@ -1066,7 +1242,7 @@ extension VitalHealthKitClient {
 
     guard self.pauseSynchronization == false else {
       VitalLogger.healthKit.info("[\(description)] skipped (sync paused)", source: "Sync")
-      return
+      return .incomplete
     }
 
     let parkingLot = self.syncSerializerLock.withLock {
@@ -1094,7 +1270,7 @@ extension VitalHealthKitClient {
       try? await parkingLot.parkIfNeeded()
 
       VitalLogger.healthKit.info("[\(description)] -1 parked; \(tags)", source: "Sync")
-      return
+      return .incomplete
     }
     defer { _ = parkingLot.tryTo(.disable) }
 
@@ -1106,20 +1282,20 @@ extension VitalHealthKitClient {
       canProceed = try await self.prioritizeSync(remappedResource, tags)
     } catch let error {
       progressStore.recordError(syncID, error, context: "prioritizeSync")
-      return
+      return .incomplete
     }
 
     guard canProceed else {
       VitalLogger.healthKit.info("[\(description)] skipped (sync deprioritized)", source: "Sync")
       progressStore.recordSync(syncID, .deprioritized)
-      return
+      return .incomplete
     }
 
     VitalLogger.healthKit.info("[\(description)] begin \(tags)", source: "Sync")
 
     guard let configuration = configuration.value else {
       VitalLogger.healthKit.info("[\(description)] configuration unavailable", source: "Sync")
-      return
+      return .incomplete
     }
 
     progressStore.recordSync(syncID, .started)
@@ -1172,13 +1348,16 @@ extension VitalHealthKitClient {
     } catch let error {
       progressStore.recordError(syncID, error, context: "[\(description)] sync instruction")
       await syncEnded(success: false)
-      return
+      return .incomplete
     }
 
     VitalLogger.healthKit.info("[\(description)] \(instruction)", source: "Sync")
 
     // Signal syncing (so the consumer can convey it to the user)
     _status.send(.syncing(resource))
+
+    // Whether this sync sent anything to the backend.
+    let didUpload = SyncPipelineFlag()
 
     @Sendable func readStep(uncommittedAnchors: [StoredAnchor]) async throws -> (ProcessedResourceData?, [StoredAnchor], hasMore: Bool) {
       // Fetch from HealthKit
@@ -1239,6 +1418,7 @@ extension VitalHealthKitClient {
           // Is final chunk?
           hasMore == false
         )
+        didUpload.set()
       } else {
         VitalLogger.healthKit.info("[\(description)] upload skipped in manual mode", source: "Sync")
       }
@@ -1265,6 +1445,11 @@ extension VitalHealthKitClient {
     pipelineScheduler.yield(.read())
 
     let uploadSemaphore = ParkingLot().semaphore
+
+    // The pipeline reads the next chunk while the current one uploads, so a later chunk can
+    // already be waiting to upload when an earlier one fails. Its anchors sit past the
+    // failed chunk: committing them would skip that chunk for good.
+    let uploadFailure = SyncPipelineFlag()
 
     let success = await withTaskGroup(of: Void.self, returning: Bool.self) { group in
       defer { pipelineScheduler.finish() }
@@ -1304,6 +1489,13 @@ extension VitalHealthKitClient {
 
               defer { uploadSemaphore.release() }
 
+              // An earlier chunk failed to upload. Uploading this one would commit anchors
+              // past it, so stop here. The failed upload reports the outcome of the sync.
+              guard uploadFailure.isSet == false else {
+                VitalLogger.healthKit.info("[\(description)] chunk dropped after an earlier upload failed", source: "Sync")
+                return
+              }
+
               let signpost2 = VitalLogger.Signpost.begin(name: "upload", description: description)
               defer { signpost2.end() }
 
@@ -1312,7 +1504,15 @@ extension VitalHealthKitClient {
                 pipelineScheduler.yield(.read(uncommittedAnchors: anchors))
               }
 
-              let dataCount = try await uploadStep(data: data, anchors: anchors, hasMore: hasMore)
+              let dataCount: Int
+              do {
+                dataCount = try await uploadStep(data: data, anchors: anchors, hasMore: hasMore)
+              } catch let error {
+                // Must be set before the semaphore is released, so that the next chunk
+                // waiting on it sees the failure.
+                uploadFailure.set()
+                throw error
+              }
               progressStore.recordSync(syncID, dataCount >= 0 ? .uploadedChunk : .noData, dataCount: dataCount)
 
               if !hasMore {
@@ -1330,17 +1530,30 @@ extension VitalHealthKitClient {
             }
           }
 
+        // When an upload has failed, nothing read after it can be committed, so stop the
+        // remaining work. When only a read failed, the upload still in flight carries a
+        // chunk that precedes it and is left to finish.
+        //
+        // Either way, wait for that work before recording the outcome. An upload that
+        // finishes afterwards records its own progress, which would otherwise replace the
+        // failure as the last status of this sync.
         case .cancelled:
+          if uploadFailure.isSet { group.cancelAll() }
+          await group.waitForAll()
           progressStore.recordSync(syncID, .cancelled)
           VitalLogger.healthKit.info("[\(description)] cancelled", source: "Sync")
           return false
 
         case .timedOut:
+          if uploadFailure.isSet { group.cancelAll() }
+          await group.waitForAll()
           progressStore.recordSync(syncID, .timedOut)
           VitalLogger.healthKit.info("[\(description)] timedOut", source: "Sync")
           return false
 
         case let .error(error):
+          if uploadFailure.isSet { group.cancelAll() }
+          await group.waitForAll()
           progressStore.recordError(syncID, error, context: "ReadAndUpload")
           return false
 
@@ -1352,10 +1565,16 @@ extension VitalHealthKitClient {
         }
       }
 
+      // The stages ended without an outcome, which happens when the sync itself is
+      // cancelled. Record that, or the sync would look as if it were still running.
+      await group.waitForAll()
+      progressStore.recordSync(syncID, .cancelled)
+      VitalLogger.healthKit.info("[\(description)] cancelled", source: "Sync")
       return false
     }
 
     await syncEnded(success: success)
+    return success ? .completed(uploaded: didUpload.isSet) : .incomplete
   }
 
   private func scheduleDeprioritizedResourceRetries() {
