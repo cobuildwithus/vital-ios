@@ -661,7 +661,8 @@ func queryHourlyStatistics(
   _ store: HKHealthStore,
   _ anchorStorage: AnchorStorage,
   _ id: HKQuantityTypeIdentifier,
-  _ instruction: SyncInstruction
+  _ instruction: SyncInstruction,
+  dependencies: StatisticsQueryDependencies? = nil
 ) async throws -> ([LocalQuantitySample], StoredAnchor?) {
 
   // Round down earliest to the start of the whole hour
@@ -682,7 +683,7 @@ func queryHourlyStatistics(
 
   let type = HKQuantityType.quantityType(forIdentifier: id)!
 
-  let statistics = try await StatisticsQueryDependencies.live(healthKitStore: store)
+  let statistics = try await (dependencies ?? .live(healthKitStore: store))
     .executeStatisticalQuery(type, earliest ..< latest, .hourly, nil)
 
   let unit = QuantityUnit(id)
@@ -1263,12 +1264,11 @@ func handleActivity(
   healthKitStore: HKHealthStore,
   vitalStorage: AnchorStorage,
   instruction: SyncInstruction,
-  options: ReadOptions
+  options: ReadOptions,
+  dependencies: StatisticsQueryDependencies? = nil
 ) async throws -> (activityPatch: ActivityPatch?, anchors: [StoredAnchor]) {
 
-  let dependencies = StatisticsQueryDependencies.live(
-    healthKitStore: healthKitStore
-  )
+  let dependencies = dependencies ?? .live(healthKitStore: healthKitStore)
 
   let deviceTimeZoneCalendar = GregorianCalendar(timeZone: .current)
 

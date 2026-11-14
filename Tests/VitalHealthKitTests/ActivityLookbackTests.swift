@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import HealthKit
 
 @testable import VitalHealthKit
 @testable import VitalCore
@@ -74,6 +75,74 @@ class ActivityLookbackTests: XCTestCase {
     )
   }
 
+  /// `handleActivity` asks HealthKit for the range the lower bound says it should.
+  func testHandleActivityQueriesFromTheLastUploadedDay() async throws {
+    let calendar = GregorianCalendar(timeZone: .current)
+    let now = Date()
+    let lastUploadedDay = calendar.offset(calendar.floatingDate(of: now), byDays: -10)
+
+    let storage = VitalHealthKitStorage(storage: .debug)
+    storage.store(
+      entity: StoredAnchor(
+        key: "activityDaySummary",
+        anchor: nil,
+        date: GregorianCalendar.utc.startOfDay(calendar.offset(lastUploadedDay, byDays: 1)),
+        vitalAnchors: nil
+      )
+    )
+
+    let queried = QueriedIntervals()
+    var dependencies = StatisticsQueryDependencies.debug
+    dependencies.executeStatisticalQuery = { _, interval, _, _ in
+      queried.append(interval)
+      return []
+    }
+
+    _ = try await handleActivity(
+      healthKitStore: HKHealthStore(),
+      vitalStorage: storage,
+      instruction: SyncInstruction(stage: .daily, query: Date.dateAgo(now, days: 30) ..< now),
+      options: ReadOptions(),
+      dependencies: dependencies
+    )
+
+    XCTAssertFalse(queried.values.isEmpty)
+    XCTAssertEqual(queried.values.map(\.lowerBound).min(), calendar.startOfDay(lastUploadedDay))
+  }
+
+  /// `queryHourlyStatistics` asks HealthKit for the range the earliest hour says it should.
+  func testQueryHourlyStatisticsQueriesFromTheLastUploadedHour() async throws {
+    let now = Date()
+    let lastUploadedHour = now.addingTimeInterval(-10 * 86400).beginningHour
+
+    let storage = VitalHealthKitStorage(storage: .debug)
+    storage.store(
+      entity: StoredAnchor(
+        key: "hourly-\(HKQuantityTypeIdentifier.stepCount.rawValue)",
+        anchor: nil,
+        date: lastUploadedHour.addingTimeInterval(3600),
+        vitalAnchors: nil
+      )
+    )
+
+    let queried = QueriedIntervals()
+    var dependencies = StatisticsQueryDependencies.debug
+    dependencies.executeStatisticalQuery = { _, interval, _, _ in
+      queried.append(interval)
+      return []
+    }
+
+    _ = try await queryHourlyStatistics(
+      HKHealthStore(),
+      storage,
+      .stepCount,
+      SyncInstruction(stage: .daily, query: Date.dateAgo(now, days: 30) ..< now),
+      dependencies: dependencies
+    )
+
+    XCTAssertEqual(queried.values, [lastUploadedHour ..< now.nextHour])
+  }
+
   /// The hourly anchor stores the end of the last hour uploaded. That hour was still in
   /// progress, so it is recomputed however long the gap.
   func testLastUploadedHourIsRecomputedAfterAnyGap() {
@@ -100,5 +169,18 @@ class ActivityLookbackTests: XCTestCase {
       hourlyStatisticsDailyStageEarliest(lastSynced: .distantPast, query: historyStart ..< now),
       historyStart
     )
+  }
+}
+
+private final class QueriedIntervals: @unchecked Sendable {
+  private let lock = NSLock()
+  private var intervals: [Range<Date>] = []
+
+  func append(_ interval: Range<Date>) {
+    lock.withLock { intervals.append(interval) }
+  }
+
+  var values: [Range<Date>] {
+    lock.withLock { intervals }
   }
 }
