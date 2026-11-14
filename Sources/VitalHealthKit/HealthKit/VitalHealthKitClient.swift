@@ -88,6 +88,24 @@ final class BackgroundDeliveryEnablementState: @unchecked Sendable {
   }
 }
 
+/// Set when a chunk upload fails during a sync.
+///
+/// The sync pipeline reads the next chunk while the current one uploads, so a later
+/// chunk can already be waiting to upload when an earlier one fails. Its anchors sit
+/// past the failed chunk: committing them would skip that chunk for good.
+final class UploadFailureFlag: @unchecked Sendable {
+  private let lock = NSLock()
+  private var failed = false
+
+  func set() {
+    lock.withLock { failed = true }
+  }
+
+  var isSet: Bool {
+    lock.withLock { failed }
+  }
+}
+
 final class BackgroundProcessingTaskState: @unchecked Sendable {
   private let lock = NSLock()
   private var expired = false
@@ -1055,7 +1073,8 @@ extension VitalHealthKitClient {
     }
   }
 
-  private func sync(_ remappedResource: RemappedVitalResource, _ tags: Set<SyncContextTag>) async {
+  // @testable
+  func sync(_ remappedResource: RemappedVitalResource, _ tags: Set<SyncContextTag>) async {
     let progressStore = SyncProgressStore.shared
     let progressReporter = SyncProgressReporter.shared
 
@@ -1265,6 +1284,7 @@ extension VitalHealthKitClient {
     pipelineScheduler.yield(.read())
 
     let uploadSemaphore = ParkingLot().semaphore
+    let uploadFailure = UploadFailureFlag()
 
     let success = await withTaskGroup(of: Void.self, returning: Bool.self) { group in
       defer { pipelineScheduler.finish() }
@@ -1304,6 +1324,13 @@ extension VitalHealthKitClient {
 
               defer { uploadSemaphore.release() }
 
+              // An earlier chunk failed to upload. Uploading this one would commit anchors
+              // past it, so stop here. The failed upload reports the outcome of the sync.
+              guard uploadFailure.isSet == false else {
+                VitalLogger.healthKit.info("[\(description)] chunk dropped after an earlier upload failed", source: "Sync")
+                return
+              }
+
               let signpost2 = VitalLogger.Signpost.begin(name: "upload", description: description)
               defer { signpost2.end() }
 
@@ -1312,7 +1339,15 @@ extension VitalHealthKitClient {
                 pipelineScheduler.yield(.read(uncommittedAnchors: anchors))
               }
 
-              let dataCount = try await uploadStep(data: data, anchors: anchors, hasMore: hasMore)
+              let dataCount: Int
+              do {
+                dataCount = try await uploadStep(data: data, anchors: anchors, hasMore: hasMore)
+              } catch let error {
+                // Must be set before the semaphore is released, so that the next chunk
+                // waiting on it sees the failure.
+                uploadFailure.set()
+                throw error
+              }
               progressStore.recordSync(syncID, dataCount >= 0 ? .uploadedChunk : .noData, dataCount: dataCount)
 
               if !hasMore {
@@ -1330,18 +1365,24 @@ extension VitalHealthKitClient {
             }
           }
 
+        // When an upload has failed, nothing read after it can be committed, so stop the
+        // remaining work. When only a read failed, the upload still in flight carries a
+        // chunk that precedes it and is left to finish.
         case .cancelled:
           progressStore.recordSync(syncID, .cancelled)
           VitalLogger.healthKit.info("[\(description)] cancelled", source: "Sync")
+          if uploadFailure.isSet { group.cancelAll() }
           return false
 
         case .timedOut:
           progressStore.recordSync(syncID, .timedOut)
           VitalLogger.healthKit.info("[\(description)] timedOut", source: "Sync")
+          if uploadFailure.isSet { group.cancelAll() }
           return false
 
         case let .error(error):
           progressStore.recordError(syncID, error, context: "ReadAndUpload")
+          if uploadFailure.isSet { group.cancelAll() }
           return false
 
         case .success:
