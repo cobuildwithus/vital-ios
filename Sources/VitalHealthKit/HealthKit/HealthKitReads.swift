@@ -11,7 +11,48 @@ typealias StatisticsHandler = (HKStatisticsCollectionQuery, HKStatisticsCollecti
 
 typealias HourlyStatisticsResultHandler = (Result<[VitalStatistics], Error>) -> Void
 
-let activityStatsDaysToLookback = 3
+/// How many days back a daily-stage sync recomputes activity day summaries and hourly
+/// statistics. Covers samples that reach HealthKit days after they were recorded, e.g. a
+/// wearable app that only writes when it is opened.
+let activityStatsDaysToLookback = 7
+
+/// The first calendar day a daily-stage activity sync recomputes.
+///
+/// `lastSynced` is the day after the last day uploaded. That last day was uploaded while it
+/// was still in progress, so it is always recomputed, however long ago it was. Otherwise the
+/// lookback window decides.
+func activityDailyStageLowerBound(
+  lastSynced: GregorianCalendar.FloatingDate,
+  proposedLowerBound: GregorianCalendar.FloatingDate,
+  proposedUpperBound: GregorianCalendar.FloatingDate,
+  in calendar: GregorianCalendar
+) -> GregorianCalendar.FloatingDate {
+  let lastUploadedDay = lastSynced > proposedLowerBound
+    ? calendar.offset(lastSynced, byDays: -1)
+    : proposedLowerBound
+
+  return max(
+    min(
+      lastUploadedDay,
+      calendar.offset(proposedUpperBound, byDays: -activityStatsDaysToLookback)
+    ),
+    proposedLowerBound
+  )
+}
+
+/// The first hour a daily-stage hourly statistics sync recomputes.
+///
+/// `lastSynced` is the end of the last hour uploaded. That hour was uploaded while it was
+/// still in progress, so it is always recomputed. Otherwise the lookback window decides.
+func hourlyStatisticsDailyStageEarliest(lastSynced: Date, query: Range<Date>) -> Date {
+  max(
+    min(
+      lastSynced.addingTimeInterval(-3600),
+      Date.dateAgo(query.upperBound, days: activityStatsDaysToLookback)
+    ),
+    query.lowerBound
+  ).beginningHour
+}
 
 enum VitalHealthKitClientError: Error {
   case invalidInterval(Date, Date, context: StaticString)
@@ -634,15 +675,7 @@ func queryHourlyStatistics(
     earliest = instruction.query.lowerBound.beginningHour
 
   case .daily:
-    // minimum of lastSynced or (upperBound - lookback),
-    // but should not be earlier than lowerBound
-    earliest = max(
-      min(
-        lastSynced,
-        Date.dateAgo(instruction.query.upperBound, days: activityStatsDaysToLookback)
-      ),
-      instruction.query.lowerBound
-    ).beginningHour
+    earliest = hourlyStatisticsDailyStageEarliest(lastSynced: lastSynced, query: instruction.query)
   }
 
   let latest: Date = instruction.query.upperBound.nextHour
@@ -1266,14 +1299,11 @@ func handleActivity(
 
   switch instruction.stage {
   case .daily:
-    // minimum of lastSynced or (upperBound - lookback),
-    // but should not be earlier than lowerBound
-    workingLowerBound = max(
-      min(
-        lastSynced,
-        deviceTimeZoneCalendar.offset(proposedUpperBound, byDays: -activityStatsDaysToLookback)
-      ),
-      proposedLowerBound
+    workingLowerBound = activityDailyStageLowerBound(
+      lastSynced: lastSynced,
+      proposedLowerBound: proposedLowerBound,
+      proposedUpperBound: proposedUpperBound,
+      in: deviceTimeZoneCalendar
     )
     workingUpperBound = proposedUpperBound
     hasMore = false
@@ -1303,7 +1333,8 @@ func handleActivity(
   let patch = activityPatchGroupedByDay(summaries: daySummaries, samples: ActivityPatch.Activity(), in: deviceTimeZoneCalendar)
 
   // [ Daily stage ]
-  // `date` has no meaning.
+  // `date` saves the day after the last day uploaded. The next sync recomputes from the
+  // day before it, or from the start of the lookback window if that is earlier.
   // [ Historical stage ]
   // `date` saves the exclusive upper bound of this iteration, a la the inclusive lower bound of
   // the next iteration.
