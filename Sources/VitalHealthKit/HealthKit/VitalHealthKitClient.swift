@@ -1470,21 +1470,28 @@ extension VitalHealthKitClient {
         // When an upload has failed, nothing read after it can be committed, so stop the
         // remaining work. When only a read failed, the upload still in flight carries a
         // chunk that precedes it and is left to finish.
+        //
+        // Either way, wait for that work before recording the outcome. An upload that
+        // finishes afterwards records its own progress, which would otherwise replace the
+        // failure as the last status of this sync.
         case .cancelled:
+          if uploadFailure.isSet { group.cancelAll() }
+          await group.waitForAll()
           progressStore.recordSync(syncID, .cancelled)
           VitalLogger.healthKit.info("[\(description)] cancelled", source: "Sync")
-          if uploadFailure.isSet { group.cancelAll() }
           return false
 
         case .timedOut:
+          if uploadFailure.isSet { group.cancelAll() }
+          await group.waitForAll()
           progressStore.recordSync(syncID, .timedOut)
           VitalLogger.healthKit.info("[\(description)] timedOut", source: "Sync")
-          if uploadFailure.isSet { group.cancelAll() }
           return false
 
         case let .error(error):
-          progressStore.recordError(syncID, error, context: "ReadAndUpload")
           if uploadFailure.isSet { group.cancelAll() }
+          await group.waitForAll()
+          progressStore.recordError(syncID, error, context: "ReadAndUpload")
           return false
 
         case .success:

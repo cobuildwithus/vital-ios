@@ -83,6 +83,12 @@ class VitalHealthKitSyncPipelineTests: XCTestCase {
     XCTAssertEqual(posts.values, [1])
     XCTAssertEqual(storage.read(key: anchorKey)?.date, chunkDate(1))
     XCTAssertFalse(storage.historicalStageDone(for: resource))
+
+    // The upload finished after the read failed. The failure must still be the last
+    // status recorded, or the sync looks like it is still in progress.
+    let latestSync = SyncProgressStore.shared.get()
+      .backfillTypes[resource.wrapped.backfillType]?.latestSync
+    XCTAssertEqual(latestSync?.lastStatus, .expectedError)
   }
 
   // MARK: - Fixtures
