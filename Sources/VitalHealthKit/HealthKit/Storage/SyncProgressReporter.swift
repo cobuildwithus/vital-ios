@@ -19,7 +19,9 @@ final class SyncProgressReporter: @unchecked Sendable {
 
   func syncEnded(_ id: SyncProgress.SyncID) async {
     let updatedCount = lock.withLock {
-      _ = active.remove(id)
+      // A sync gains tags while it runs (e.g. the historical stage), so match on what
+      // identifies it. Matching the whole ID left such a sync in the set for good.
+      active = active.filter { $0.resource != id.resource || $0.start != id.start }
       return active.count
     }
 

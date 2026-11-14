@@ -12,6 +12,17 @@ class VitalHealthKitSyncPipelineTests: XCTestCase {
   private let resource = RemappedVitalResource(wrapped: .vitals(.glucose))
   private let anchorKey = "sync-pipeline-test"
 
+  /// Sync progress is one store for the whole process. Start each test from an empty one.
+  override func setUp() {
+    super.setUp()
+    SyncProgressStore.shared.clear()
+  }
+
+  override func tearDown() {
+    SyncProgressStore.shared.clear()
+    super.tearDown()
+  }
+
   /// The pipeline reads chunk 2 while chunk 1 uploads. When the upload of chunk 1 fails,
   /// the waiting upload of chunk 2 must not go out: its anchors sit past chunk 1, so
   /// committing them would mean chunk 1 is never read again.
@@ -38,16 +49,18 @@ class VitalHealthKitSyncPipelineTests: XCTestCase {
       }
     )
 
-    await client.sync(resource, [.manual])
+    let failed = await client.sync(resource, [.manual])
 
+    XCTAssertEqual(failed, .incomplete)
     XCTAssertEqual(posts.values, [1], "chunk 2 must not be uploaded after chunk 1 failed")
     XCTAssertNil(storage.read(key: anchorKey), "no anchor may be committed past the failed chunk")
     XCTAssertFalse(storage.historicalStageDone(for: resource))
 
     // The next sync starts again from the failed chunk and loses nothing.
     failFirstChunk.value = false
-    await client.sync(resource, [.manual])
+    let recovered = await client.sync(resource, [.manual])
 
+    XCTAssertEqual(recovered, .completed(uploaded: true))
     XCTAssertEqual(posts.values, [1, 1, 2, 3])
     XCTAssertEqual(storage.read(key: anchorKey)?.date, chunkDate(3))
     XCTAssertTrue(storage.historicalStageDone(for: resource))
@@ -89,6 +102,49 @@ class VitalHealthKitSyncPipelineTests: XCTestCase {
     let latestSync = SyncProgressStore.shared.get()
       .backfillTypes[resource.wrapped.backfillType]?.latestSync
     XCTAssertEqual(latestSync?.lastStatus, .expectedError)
+  }
+
+  /// A sync that is cancelled as a whole, e.g. when a processing task expires, ends without
+  /// any of its steps reporting an outcome. It must still be recorded as cancelled, and a
+  /// later delivery must see it as unfinished.
+  func testCancelledSyncIsRecordedAndPendingRetry() async throws {
+    let storage = try makeStorage()
+    let uploadStarted = Gate()
+
+    let client = makeClient(
+      storage: storage,
+      post: { chunk in
+        if chunk == 1 {
+          uploadStarted.open()
+          try await Task.sleep(nanoseconds: 30 * NSEC_PER_SEC)
+        }
+      }
+    )
+
+    let resource = self.resource
+    let sync = Task { await client.sync(resource, [.manual]) }
+    await uploadStarted.wait()
+    sync.cancel()
+    let outcome = await sync.value
+
+    XCTAssertEqual(outcome, .incomplete)
+    XCTAssertNil(storage.read(key: anchorKey))
+
+    // The sync picked up the historical stage tag while it ran. It must still be taken
+    // off the list of running syncs, or it could never be retried.
+    XCTAssertFalse(SyncProgressReporter.shared.syncingResources().contains(resource.wrapped))
+
+    let progress = SyncProgressStore.shared.get()
+    XCTAssertEqual(progress.backfillTypes[resource.wrapped.backfillType]?.latestSync?.lastStatus, .cancelled)
+
+    let pending = resourcesPendingRetry(
+      in: progress,
+      activeResources: [resource],
+      excluding: [],
+      syncing: SyncProgressReporter.shared.syncingResources(),
+      now: Date().addingTimeInterval(failedSyncRetryInterval)
+    )
+    XCTAssertEqual(pending, [resource])
   }
 
   // MARK: - Fixtures
